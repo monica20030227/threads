@@ -1,5 +1,7 @@
 import os
 import time
+import re
+import pickle
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -13,6 +15,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+COOKIE_FILE = "threads_cookies.pkl"
 
 
 # =========================
@@ -28,6 +31,8 @@ def setup_driver(headless=False):
     options.add_argument("--lang=zh-TW")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
 
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -38,87 +43,165 @@ def setup_driver(headless=False):
 
 
 # =========================
+# Cookie 登入功能
+# =========================
+def save_cookies(driver):
+    with open(COOKIE_FILE, "wb") as f:
+        pickle.dump(driver.get_cookies(), f)
+
+
+def load_cookies(driver):
+    if not os.path.exists(COOKIE_FILE):
+        return False
+
+    driver.get("https://www.threads.net/")
+    time.sleep(3)
+
+    with open(COOKIE_FILE, "rb") as f:
+        cookies = pickle.load(f)
+
+    for cookie in cookies:
+        try:
+            driver.add_cookie(cookie)
+        except:
+            pass
+
+    driver.refresh()
+    time.sleep(5)
+    return True
+
+
+def login_threads_once():
+    driver = setup_driver(headless=False)
+
+    driver.get("https://www.threads.net/")
+    time.sleep(5)
+
+    print("請在跳出的 Chrome 視窗手動登入 Threads。")
+    print("登入完成後，回到這個終端機按 Enter。")
+
+    input("登入完成後請按 Enter...")
+
+    save_cookies(driver)
+    driver.quit()
+
+
+# =========================
+# 文字清理
+# =========================
+def clean_text(text):
+    text = text.strip()
+    text = re.sub(r"\s+", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+def is_ui_text(text):
+    ui_words = [
+        "登入", "註冊", "Threads", "Instagram", "Meta",
+        "搜尋", "查看更多", "回覆", "轉發", "分享",
+        "隱私", "使用條款", "Cookie", "下載應用程式",
+        "忘記密碼", "建立帳號", "通知", "首頁",
+        "你的個人檔案", "活動", "設定"
+    ]
+
+    if text in ui_words:
+        return True
+
+    if len(text) < 6:
+        return True
+
+    if len(text) > 1000:
+        return True
+
+    if text.count("\n") > 18:
+        return True
+
+    return False
+
+
+def is_duplicate_or_subset(text, seen_texts):
+    for old in seen_texts[:]:
+        if text == old:
+            return True
+
+        if text in old and len(text) < len(old) * 0.8:
+            return True
+
+        if old in text and len(old) < len(text) * 0.8:
+            seen_texts.remove(old)
+            return False
+
+    return False
+
+
+# =========================
 # Threads 搜尋
 # =========================
-def search_threads_by_keyword(keyword, max_posts=10, scroll_times=5):
-    """
-    用 Selenium 開 Threads 搜尋頁，抓公開可見文字。
-    注意：Threads 頁面結構會變，此版適合 MVP demo。
-    """
-
+def search_threads_by_keyword(keyword, max_posts=10, scroll_times=15, headless=False):
     search_url = f"https://www.threads.net/search?q={keyword}"
 
-    driver = setup_driver(headless=False)
-    driver.get(search_url)
+    driver = setup_driver(headless=headless)
 
-    time.sleep(6)
+    has_cookie = load_cookies(driver)
+
+    driver.get(search_url)
+    time.sleep(8)
 
     posts = []
-    seen = set()
+    seen_texts = []
 
-    for _ in range(scroll_times):
-        elements = driver.find_elements(By.XPATH, "//span | //div")
+    try:
+        for i in range(scroll_times):
+            elements = driver.find_elements(
+                By.XPATH,
+                "//article | //*[@role='article'] | //div[string-length(normalize-space()) > 15]"
+            )
 
-        for el in elements:
-            try:
-                text = el.text.strip()
-            except:
-                continue
+            for el in elements:
+                try:
+                    text = clean_text(el.text)
+                except:
+                    continue
 
-            if not text:
-                continue
+                if not text:
+                    continue
 
-            if len(text) < 8:
-                continue
+                if keyword not in text:
+                    continue
 
-            if text in seen:
-                continue
+                if is_ui_text(text):
+                    continue
 
-            # 必須包含關鍵字，避免抓到大量介面文字
-            if keyword not in text:
-                continue
+                if is_duplicate_or_subset(text, seen_texts):
+                    continue
 
-            skip_words = [
-                "登入",
-                "註冊",
-                "Threads",
-                "Instagram",
-                "搜尋",
-                "查看更多",
-                "回覆",
-                "轉發",
-                "分享",
-                "隱私",
-                "使用條款"
-            ]
+                seen_texts.append(text)
 
-            if any(word == text for word in skip_words):
-                continue
+                posts.append({
+                    "source": "Threads_Selenium_Login" if has_cookie else "Threads_Selenium_NoLogin",
+                    "keyword": keyword,
+                    "text": text,
+                    "url": search_url
+                })
 
-            seen.add(text)
-
-            posts.append({
-                "source": "Threads_Selenium",
-                "keyword": keyword,
-                "text": text,
-                "url": search_url
-            })
+                if len(posts) >= max_posts:
+                    break
 
             if len(posts) >= max_posts:
                 break
 
-        if len(posts) >= max_posts:
-            break
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(3)
 
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(3)
+    finally:
+        driver.quit()
 
-    driver.quit()
-    return posts
+    return posts[:max_posts]
 
 
 # =========================
-# 規則版 AI Summary
+# 規則版 Summary
 # =========================
 def rule_based_summary(posts):
     texts = [p["text"] for p in posts]
@@ -129,7 +212,8 @@ def rule_based_summary(posts):
         "停電": ["停電", "斷電", "電力"],
         "道路中斷": ["道路", "封路", "交通", "無法通行", "坍方"],
         "救援需求": ["受困", "救援", "物資", "砂包", "撤離"],
-        "土石流": ["土石流", "坍方", "落石"]
+        "土石流": ["土石流", "坍方", "落石"],
+        "颱風": ["颱風", "強風", "豪雨", "暴雨"]
     }
 
     detected_types = []
@@ -153,26 +237,26 @@ def rule_based_summary(posts):
         needs.append("物資支援")
     if "封路" in joined_text or "無法通行" in joined_text:
         needs.append("交通管制")
+    if "停電" in joined_text or "斷電" in joined_text:
+        needs.append("電力搶修")
 
     if not needs:
         needs = ["尚未明確偵測"]
 
     confidence = min(1.0, 0.45 + 0.05 * len(posts))
 
-    summary = {
+    return {
         "災害類型": detected_types,
-        "摘要": f"系統共擷取 {len(posts)} 筆 Threads 相關貼文。多筆內容可能涉及 {', '.join(detected_types)}，建議進一步比對官方資料與感測器資訊。",
+        "摘要": f"系統共擷取 {len(posts)} 筆 Threads 相關貼文。內容可能涉及 {', '.join(detected_types)}，建議進一步比對官方資料、新聞或現場回報。",
         "可能需求": needs,
         "可信度": round(confidence, 2),
-        "資料來源": ["Threads_Selenium"],
-        "限制說明": "此結果根據公開貼文文字初步整理，尚需官方資料或現場回報交叉驗證。"
+        "資料來源": list(set([p["source"] for p in posts])),
+        "限制說明": "此結果根據 Threads 公開或登入後可見貼文初步整理，仍需官方資料交叉驗證。"
     }
-
-    return summary
 
 
 # =========================
-# GPT Summary，可選
+# GPT Summary
 # =========================
 def gpt_summary(posts):
     if not OPENAI_API_KEY:
@@ -184,7 +268,7 @@ def gpt_summary(posts):
         client = OpenAI(api_key=OPENAI_API_KEY)
 
         texts = "\n\n".join(
-            [f"{i+1}. {p['text']}" for i, p in enumerate(posts)]
+            [f"{i + 1}. {p['text']}" for i, p in enumerate(posts)]
         )
 
         prompt = f"""
@@ -230,22 +314,43 @@ st.set_page_config(page_title="Threads 災情 AI 摘要", layout="wide")
 
 st.title("🌐 Threads 災情貼文搜尋 + AI 統整 MVP")
 
-st.write("輸入關鍵字後，系統會嘗試搜尋 Threads 公開貼文，先顯示前 10 筆，再由 AI 整理摘要。")
+st.write("第一次使用請先登入 Threads，之後系統會儲存 cookie，下次搜尋會自動使用登入狀態。")
+
+st.divider()
+
+if st.button("第一次使用：登入 Threads 並儲存狀態"):
+    with st.spinner("請在跳出的 Chrome 視窗登入 Threads，登入後回到終端機按 Enter。"):
+        login_threads_once()
+
+    st.success("Threads 登入狀態已儲存，下次搜尋會自動使用登入狀態。")
+
+if os.path.exists(COOKIE_FILE):
+    st.success("目前已偵測到 Threads 登入 cookie。")
+else:
+    st.warning("目前尚未偵測到 Threads 登入 cookie，搜尋結果可能較少。")
+
+st.divider()
 
 keyword = st.text_input("請輸入搜尋關鍵字", value="颱風")
-max_posts = st.number_input("顯示貼文數量", min_value=1, max_value=30, value=10)
+max_posts = st.number_input("顯示貼文數量", min_value=1, max_value=50, value=10)
 
-use_gpt = st.checkbox("使用 GPT 做摘要（需要 OPENAI_API_KEY）", value=False)
+headless = st.checkbox("背景執行瀏覽器 headless", value=False)
+use_gpt = st.checkbox("使用 GPT 做摘要，需要 OPENAI_API_KEY", value=False)
 
 if st.button("開始搜尋並統整"):
     if not keyword.strip():
         st.error("請輸入關鍵字")
     else:
-        with st.spinner("正在搜尋 Threads 公開貼文..."):
-            posts = search_threads_by_keyword(keyword.strip(), max_posts=max_posts)
+        with st.spinner("正在搜尋 Threads 貼文..."):
+            posts = search_threads_by_keyword(
+                keyword=keyword.strip(),
+                max_posts=max_posts,
+                scroll_times=15,
+                headless=headless
+            )
 
         if not posts:
-            st.warning("沒有抓到貼文。可能原因：Threads 搜尋頁限制、需要登入、或公開資料不足。")
+            st.warning("沒有抓到貼文。可能原因：Threads 搜尋頁限制、cookie 失效、需要重新登入、公開資料不足，或頁面結構改變。")
         else:
             st.success(f"成功取得 {len(posts)} 筆貼文")
 
@@ -254,11 +359,14 @@ if st.button("開始搜尋並統整"):
             st.subheader("📌 搜尋到的貼文")
             st.dataframe(df, use_container_width=True)
 
-            csv = df.to_csv(index=False).encode("utf-8-sig")
+            safe_keyword = re.sub(r'[\\/:*?"<>|]', "_", keyword.strip())
+
+            csv = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
             st.download_button(
                 label="下載 CSV",
                 data=csv,
-                file_name=f"threads_{keyword}.csv",
+                file_name=f"threads_{safe_keyword}.csv",
                 mime="text/csv"
             )
 
